@@ -1,0 +1,5 @@
+openai
+python-dotenv
+tavily-python
+requests
+pydantic
