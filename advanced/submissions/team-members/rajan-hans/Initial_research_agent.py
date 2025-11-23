@@ -1,176 +1,199 @@
-"""
-Very simple multi-agent stock workflow using OpenAI Agents SDK + handoffs.
+"""Simple, easy-to-read multi-agent orchestrator.
 
-Agents:
-- research_agent: plans & delegates via handoffs
-- current_price_agent: describes current price context for the ticker
-- sentiment_analysis_agent: analyzes news / sentiment
-- technical_analysis_agent: provides simple technical analysis
-- synthesizer_agent: merges everything into Buy/Hold/Sell
+This module builds one main orchestration function `analyze_stock` that:
+- creates three helper agents: `current_price_agent`, `sentiment_analysis_agent`,
+  and `technical_analysis_agent`;
+- runs the three helpers in parallel (via threads);
+- then feeds their textual outputs to `synthesizer_agent` to produce a single
+  'Buy' / 'Hold' / 'Sell' recommendation with reasoning.
 
-NOTE: This is a *skeleton* — helper agents just reason from model knowledge.
-Replace their instructions/tools with real data sources as you evolve it.
+Usage (CLI):
+    python Initial_research_agent.py AAPL --model gpt-4.1-mini
+
+The code intentionally keeps the prompts and structure minimal so it's easy
+to read and modify.
 """
 
 import os
 from dotenv import load_dotenv
-from agents import Agent, Runner, ModelSettings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Tuple
 
-DEFAULT_MODEL = "gpt-4.1-mini"  # or any model you prefer
-print("Program started")
+from agents import Agent, Runner
+
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DEFAULT_MODEL = "gpt-4.1-mini"
 
-# ---------------------------------------------------------------------------
-# Helper agents
-# ---------------------------------------------------------------------------
 
-current_price_agent = Agent(
-    name="current_price_agent",
-    model=DEFAULT_MODEL,
-    instructions=(
-        "You are a stock price specialist.\n"
-        "Task: Given a stock ticker symbol in the conversation, "
-        "describe the *approximate* current price zone and recent price action.\n\n"
-        "Constraints:\n"
-        "- If you are not sure of the exact live price, say so explicitly.\n"
-        "- Still provide a rough price range and short-term price trend "
-        "(uptrend, downtrend, sideways) based on your knowledge.\n"
-        "- Keep the answer focused on price, support/resistance, and volatility.\n"
-    ),
-)
+def build_agents(model_name: str = DEFAULT_MODEL) -> Tuple[Agent, Agent, Agent, Agent]:
+    """Create and return the helper agents and the synthesizer.
 
-sentiment_analysis_agent = Agent(
-    name="sentiment_analysis_agent",
-    model=DEFAULT_MODEL,
-    instructions=(
-        "You are a market sentiment analyst.\n"
-        "Task: For the given stock ticker, analyze overall market sentiment.\n\n"
-        "Consider:\n"
-        "- Recent news tone (positive/neutral/negative)\n"
-        "- Social media and retail sentiment (bullish/bearish/mixed)\n"
-        "- Any notable macro or sector mood that affects this ticker\n\n"
-        "Important:\n"
-        "- If you are not sure about very recent news, say so explicitly.\n"
-        "- Still provide a reasoned sentiment view and list 3–5 key points.\n"
-    ),
-)
+    Returns: (current_price_agent, sentiment_analysis_agent,
+              technical_analysis_agent, synthesizer_agent)
+    """
 
-technical_analysis_agent = Agent(
-    name="technical_analysis_agent",
-    model=DEFAULT_MODEL,
-    instructions=(
-        "You are a technical analysis specialist.\n"
-        "Task: For the given stock ticker, provide a concise technical view.\n\n"
-        "Base your answer on:\n"
-        "- Trend (short-, medium-, and long-term if possible)\n"
-        "- Key indicators in words (e.g., moving averages, RSI, MACD — "
-        "you can describe their likely state even if you don't have exact values).\n"
-        "- Important support and resistance levels (approximate ranges are fine).\n"
-        "- Momentum and volatility assessment.\n"
-        "Be explicit about any uncertainty and keep the answer focused on TA only.\n"
-    ),
-)
+    current_price_agent = Agent(
+        name="current_price_agent",
+        model=model_name,
+        instructions=(
+            "You are a market-data researcher. Given a stock ticker, do a short, focused"
+            " investigation and return the result in three parts:\n"
+            "1) Price Summary (1–2 sentences): current approximate price band, recent"
+            " intraday/24h movement, and short-term trend (up/down/sideways).\n"
+            "2) Key Recent Drivers (3 bullet points): recent news/events, earnings,"
+            " or macro factors that could explain the move. Use dates where relevant.\n"
+            "3) Confidence & Sources (1 line): a short confidence tag (High/Medium/Low)"
+            " and 1–2 short source hints (e.g., 'news headlines', 'earnings release',"
+            " 'market data').\n"
+            "Keep answers concise and factual. If you are unsure about exact numeric"
+            " price, state uncertainty explicitly and provide a reasoned range."
+        ),
+    )
 
-synthesizer_agent = Agent(
-    name="synthesizer_agent",
-    model=DEFAULT_MODEL,
-    instructions=(
-        "You are an investment recommendation synthesizer.\n"
-        "You receive a conversation that already includes:\n"
-        "- A research plan from the research agent\n"
-        "- Findings from current_price_agent\n"
-        "- Findings from sentiment_analysis_agent\n"
-        "- Findings from technical_analysis_agent\n\n"
-        "Your job:\n"
-        "1. Read all previous content carefully.\n"
-        "2. Produce a clear recommendation for the stock: exactly one of 'Buy', 'Hold', or 'Sell'.\n"
-        "3. Explain your reasoning in detail.\n"
-        "4. List key supporting points from:\n"
-        "   - Price & recent trend\n"
-        "   - Sentiment & news\n"
-        "   - Technical indicators / chart structure\n"
-        "5. Outline the main risks and what could invalidate your view.\n"
-        "6. Suggest practical next steps or checks (e.g., confirm latest earnings, "
-        "check news, validate levels on a real chart).\n"
-    ),
-)
+    sentiment_analysis_agent = Agent(
+        name="sentiment_analysis_agent",
+        model=model_name,
+        instructions=(
+            "You are a sentiment researcher. For the given ticker, perform a concise"
+            " sentiment review and return three sections:\n"
+            "1) Headline Sentiment (1 sentence): overall tone (Positive/Neutral/Negative).\n"
+            "2) Supporting Evidence (3 short bullets): recent headlines, social-media"
+            " signals or analyst notes that justify the headline sentiment. Include dates"
+            " or short citations where possible.\n"
+            "3) Market Impact & Confidence (1 line): expected near-term impact (Bullish/"
+            "Bearish/Neutral) and a confidence tag (High/Medium/Low).\n"
+            "Prefer factual statements and brief citations; avoid speculation beyond the"
+            " evidence you list."
+        ),
+    )
 
-# ---------------------------------------------------------------------------
-# Main research / orchestration agent (uses handoffs)
-# ---------------------------------------------------------------------------
+    technical_analysis_agent = Agent(
+        name="technical_analysis_agent",
+        model=model_name,
+        instructions=(
+            "You are a technical analyst. For the given ticker, produce three sections:\n"
+            "1) Trend Summary (1 sentence): short/medium-term trend (rising/falling/sideways).\n"
+            "2) Indicators & Levels (3 bullets): describe likely state of key indicators"
+            " (moving averages, RSI, MACD in words) and list 1–2 approximate support/resistance"
+            " ranges (rounded).\n"
+            "3) Trade Context & Confidence (1 line): what kind of trader/view this suits"
+            " (short-term swing, longer-term investor) and a confidence tag.\n"
+            "If precise indicator values aren't available, describe expected direction and"
+            " why (e.g., 'price below 50-day MA -> bearish momentum'). Keep answers concise."
+        ),
+    )
 
-research_agent = Agent(
-    name="research_agent",
-    model=DEFAULT_MODEL,
-    # Important: parallel_tool_calls=True allows the model to call multiple
-    # handoffs (sub-agents) in the same turn if it decides to.
-    model_settings=ModelSettings(
-        temperature=0.3,
-        parallel_tool_calls=True,
-    ),
-    instructions=(
-        "You are the main research coordinator for stock analysis.\n\n"
-        "Overall task:\n"
-        "- Given a stock ticker, create a brief research plan.\n"
-        "- Then delegate work to specialized agents via handoffs:\n"
-        "  * current_price_agent\n"
-        "  * sentiment_analysis_agent\n"
-        "  * technical_analysis_agent\n"
-        "- After helpers have done their work, hand off to synthesizer_agent "
-        "to produce the final 'Buy', 'Hold', or 'Sell' recommendation.\n\n"
-        "Process you MUST follow:\n"
-        "1. **Planning step** – First, write a short 'Research Plan' as a numbered list "
-        "   (1–5 steps max) tailored to the given ticker.\n"
-        "2. **Execution step** – Use handoffs to the helper agents listed above. "
-        "   You may call them in any order; it is okay to use them in parallel.\n"
-        "3. **Synthesis step** – Once you judge that the helpers have provided enough "
-        "   information, hand off control to the synthesizer_agent so it can make "
-        "   the final investment recommendation.\n\n"
-        "Important details:\n"
-        "- Do not try to be the final decision-maker yourself.\n"
-        "- Your role ends once you hand off to synthesizer_agent.\n"
-        "- Make sure each helper agent clearly sees the stock ticker in the conversation.\n"
-    ),
-    # Handoffs: these agents can be delegated to by the research_agent.
-    handoffs=[
+    synthesizer_agent = Agent(
+        name="synthesizer_agent",
+        model=model_name,
+        instructions=(
+            "You are an investment synthesizer. You receive three labeled sections"
+            " with structured sub-sections from specialist agents.\n\n"
+            "Input Format:\n"
+            "- Price: includes 'Price Summary', 'Key Recent Drivers' (3 bullets),"
+            " 'Confidence & Sources'.\n"
+            "- Sentiment: includes 'Headline Sentiment', 'Supporting Evidence' (3 bullets),"
+            " 'Market Impact & Confidence'.\n"
+            "- Technical: includes 'Trend Summary', 'Indicators & Levels' (3 bullets),"
+            " 'Trade Context & Confidence'.\n\n"
+            "Your Task:\n"
+            "1) Read each section carefully, noting confidence tags and sources.\n"
+            "2) Produce exactly ONE recommendation: 'Buy', 'Hold', or 'Sell'.\n"
+            "3) Explain your reasoning with:\n"
+            "   - 3–4 key supporting points (cite evidence from the three sections).\n"
+            "   - 1 main risk or invalidation scenario.\n"
+            "   - Timeframe for your view (e.g., 'short-term swing', 'intermediate hold').\n"
+            "4) Use confidence levels from the specialist agents to gauge conviction.\n"
+            "Prefer evidence-based reasoning; flag any conflicts or low-confidence areas."
+        ),
+    )
+
+    return (
         current_price_agent,
         sentiment_analysis_agent,
         technical_analysis_agent,
         synthesizer_agent,
-    ],
-)
-
-
-# ---------------------------------------------------------------------------
-# Small helper to run the workflow for a given ticker
-# ---------------------------------------------------------------------------
-
-
-def analyze_stock(ticker: str) -> str:
-    """
-    Kicks off the whole workflow starting from the research_agent.
-
-    The research_agent will:
-      - Plan
-      - Handoff to helpers
-      - Handoff to synthesizer_agent
-
-    Returns the final text output (synthesizer_agent's recommendation).
-    """
-    user_task = (
-        f"Analyze stock '{ticker}'.\n"
-        f"Follow your planning → helper handoffs → synthesizer handoff workflow.\n"
-        f"Final result should be a clear 'Buy', 'Hold', or 'Sell' with reasoning."
     )
 
-    result = Runner.run_sync(research_agent, user_task)
-    # result.final_output is the final string produced by the last agent (synthesizer)
-    return result.final_output
+
+def _run_agent_and_get_text(agent: Agent, prompt: str) -> str:
+    """Run an agent synchronously and return the textual output.
+
+    Uses `Runner.run_sync` and falls back gracefully if the returned object
+    doesn't expose `final_output`.
+    """
+    res = Runner.run_sync(agent, prompt)
+    return getattr(res, "final_output", str(res))
+
+
+def analyze_stock(ticker: str, model_name: str = DEFAULT_MODEL) -> str:
+    """Orchestrate helpers for `ticker` and return the synthesizer output.
+
+    Steps:
+    1. Build agents with `build_agents`.
+    2. Create small prompts for each helper.
+    3. Run the three helpers concurrently using threads.
+    4. Combine their outputs and call the synthesizer.
+    """
+    (price_agent, sentiment_agent, technical_agent, synth_agent) = build_agents(
+        model_name
+    )
+
+    # Small, specific prompts for each helper
+    price_prompt = f"Ticker: {ticker}\nProvide a short price context (1-2 sentences)."
+    sentiment_prompt = (
+        f"Ticker: {ticker}\nProvide 3 short bullets about market sentiment."
+    )
+    technical_prompt = (
+        f"Ticker: {ticker}\nProvide a concise technical summary (trend + 1-2 levels)."
+    )
+
+    helpers = [
+        ("Price", price_agent, price_prompt),
+        ("Sentiment", sentiment_agent, sentiment_prompt),
+        ("Technical", technical_agent, technical_prompt),
+    ]
+
+    results = {}
+    # Run helpers in parallel threads to keep the code simple but concurrent
+    with ThreadPoolExecutor(max_workers=3) as exe:
+        futures = {
+            exe.submit(_run_agent_and_get_text, a, p): label
+            for (label, a, p) in helpers
+        }
+        for fut in as_completed(futures):
+            label = futures[fut]
+            try:
+                results[label] = fut.result()
+            except Exception as e:
+                results[label] = f"ERROR: {e}"
+
+    # Build synthesizer prompt by labeling each section clearly
+    synth_input = (
+        f"Ticker: {ticker}\n\n"
+        "Price:\n" + results.get("Price", "(no data)") + "\n\n"
+        "Sentiment:\n" + results.get("Sentiment", "(no data)") + "\n\n"
+        "Technical:\n" + results.get("Technical", "(no data)") + "\n\n"
+        "Based on the sections above, give exactly one recommendation (Buy/Hold/Sell),"
+        " 3-5 supporting points, and one risk that could invalidate the view."
+    )
+
+    final = _run_agent_and_get_text(synth_agent, synth_input)
+    return final
 
 
 if __name__ == "__main__":
-    ticker = "AAPL"
-    final_report = analyze_stock(ticker)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Simple stock research orchestrator")
+    parser.add_argument(
+        "ticker", nargs="?", default="AAPL", help="Ticker symbol (e.g. AAPL)"
+    )
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL, help="Model name to use for agents"
+    )
+    args = parser.parse_args()
+
+    output = analyze_stock(args.ticker, model_name=args.model)
     print("\n=== FINAL RECOMMENDATION ===\n")
-    print(final_report)
+    print(output)
