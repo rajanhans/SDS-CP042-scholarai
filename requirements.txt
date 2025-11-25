@@ -42,4 +42,3 @@ ipykernel
 openai-agents 
 python-dotenv 
 tavily-python 
-requests

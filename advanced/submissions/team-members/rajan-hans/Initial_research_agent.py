@@ -142,10 +142,10 @@ def analyze_stock(ticker: str, model_name: str = DEFAULT_MODEL) -> str:
     # Small, specific prompts for each helper
     price_prompt = f"Ticker: {ticker}\nProvide a short price context (1-2 sentences)."
     sentiment_prompt = (
-        f"Ticker: {ticker}\nProvide 3 short bullets about market sentiment."
+        f"Ticker: {ticker}\nProvide 5 short bullets about market sentiment."
     )
     technical_prompt = (
-        f"Ticker: {ticker}\nProvide a concise technical summary (trend + 1-2 levels)."
+        f"Ticker: {ticker}\nProvide a concise technical summary (trend + 1-2 levels). Do not miss any important details"
     )
 
     helpers = [
