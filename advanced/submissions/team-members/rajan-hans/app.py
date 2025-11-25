@@ -8,6 +8,7 @@ The app lets you choose a ticker and a model name and runs the analysis.
 """
 
 import streamlit as st
+
 from Initial_research_agent import analyze_stock, DEFAULT_MODEL
 
 st.set_page_config(page_title="Stock Research Demo", layout="centered")
